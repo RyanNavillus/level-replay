@@ -96,7 +96,7 @@ parser.add_argument(
     default=25e6,
     help='number of environment steps to train')
 parser.add_argument(
-    '--env_name',
+    '--env_id',
     type=str,
     default='bigfish',
     help='environment to train on')

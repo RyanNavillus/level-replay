@@ -30,12 +30,34 @@ os.environ["OMP_NUM_THREADS"] = "1"
 last_checkpoint_time = None
 
 
+PROCGEN_RETURN_BOUNDS = {
+    "coinrun": (5, 10),
+    "starpilot": (2.5, 64),
+    "caveflyer": (3.5, 12),
+    "dodgeball": (1.5, 19),
+    "fruitbot": (-1.5, 32.4),
+    "chaser": (0.5, 13),
+    "miner": (1.5, 13),
+    "jumper": (3, 10),
+    "leaper": (3, 10),
+    "maze": (5, 10),
+    "bigfish": (1, 40),
+    "heist": (3.5, 10),
+    "climber": (2, 12.6),
+    "plunder": (4.5, 30),
+    "ninja": (3.5, 10),
+    "bossfight": (0.5, 13),
+}
+
+
 def train(args, seeds):
     global last_checkpoint_time
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     device = torch.device("cuda:0" if args.cuda else "cpu")
     if 'cuda' in device.type:
         print('Using CUDA\n')
+    else:
+        print('Not using CUDA\n')
 
     torch.set_num_threads(1)
 
@@ -53,6 +75,17 @@ def train(args, seeds):
 
     checkpointpath = os.path.expandvars(
         os.path.expanduser("%s/%s/%s" % (log_dir, args.xpid, "model.tar"))
+    )
+
+    import wandb
+    wandb.init(
+        project="cleanrl",
+        entity="ryansullivan",
+        sync_tensorboard=True,
+        config=vars(args),
+        name="LevelReplay README pytorch1.6 cuda10.2",
+        monitor_gym=True,
+        save_code=True,
     )
 
     # Configure actor envs
@@ -85,16 +118,16 @@ def train(args, seeds):
         distribution_mode=args.distribution_mode,
         paint_vel_info=args.paint_vel_info,
         level_sampler_args=level_sampler_args)
-    
+
     is_minigrid = args.env_name.startswith('MiniGrid')
 
-    actor_critic = model_for_env_name(args, envs)       
+    actor_critic = model_for_env_name(args, envs)
     actor_critic.to(device)
 
     rollouts = RolloutStorage(args.num_steps, args.num_processes,
                                 envs.observation_space.shape, envs.action_space,
                                 actor_critic.recurrent_hidden_state_size)
-        
+
     batch_size = int(args.num_processes * args.num_steps / args.num_mini_batch)
 
     def checkpoint():
@@ -150,11 +183,19 @@ def train(args, seeds):
             # Obser reward and next obs
             obs, reward, done, infos = envs.step(action)
 
+            global_step = (j + 1) * args.num_processes * step
+
             # Reset all done levels by sampling from level sampler
             for i, info in enumerate(infos):
                 if 'episode' in info.keys():
                     episode_rewards.append(info['episode']['r'])
-
+                    print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+                    stats = {
+                        "episodic_return": info["episode"]["r"],
+                        "episodic_length": info["episode"]["l"],
+                        "global_step": global_step
+                    }
+                    wandb.log(stats, step=global_step)
                 if level_sampler:
                     level_seeds[i][0] = info['level_seed']
 
@@ -166,8 +207,8 @@ def train(args, seeds):
                  for info in infos])
 
             rollouts.insert(
-                obs, recurrent_hidden_states, 
-                action, action_log_prob, action_log_dist, 
+                obs, recurrent_hidden_states,
+                action, action_log_prob, action_log_dist,
                 value, reward, masks, bad_masks, level_seeds)
 
         with torch.no_grad():
@@ -175,11 +216,12 @@ def train(args, seeds):
             next_value = actor_critic.get_value(
                 obs_id, rollouts.recurrent_hidden_states[-1],
                 rollouts.masks[-1]).detach()
-            
+
         rollouts.compute_returns(next_value, args.gamma, args.gae_lambda)
 
         # Update level sampler
         if level_sampler:
+            print("update")
             level_sampler.update_with_rollouts(rollouts)
 
         value_loss, action_loss, dist_entropy = agent.update(rollouts)
@@ -193,15 +235,21 @@ def train(args, seeds):
 
             update_end_time = timer()
             num_interval_updates = 1 if j == 0 else args.log_interval
-            sps = num_interval_updates*(args.num_processes * args.num_steps) / (update_end_time - update_start_time)
+            sps = num_interval_updates * (args.num_processes * args.num_steps) / (update_end_time - update_start_time)
             update_start_time = update_end_time
 
             logging.info(f"\nUpdate {j} done, {total_num_steps} steps\n  ")
+            print(f"\nUpdate {j} done, {total_num_steps} steps\n  ")
             logging.info(f"\nEvaluating on {args.num_test_seeds} test levels...\n  ")
             eval_episode_rewards = evaluate(args, actor_critic, args.num_test_seeds, device)
-
+            
             logging.info(f"\nEvaluating on {args.num_test_seeds} train levels...\n  ")
             train_eval_episode_rewards = evaluate(args, actor_critic, args.num_test_seeds, device, start_level=0, num_levels=args.num_train_seeds, seeds=seeds)
+            print(f"\nEpisode Reward: {np.mean(eval_episode_rewards)}\tSPS: {sps}")
+
+            env_min, env_max = PROCGEN_RETURN_BOUNDS[args.env_id]
+            normalized_test_returns = (np.mean(eval_episode_rewards) - env_min) / (env_max - env_min)
+            normalized_train_returns = (np.mean(train_eval_episode_rewards) - env_min) / (env_max - env_min)
 
             stats = { 
                 "step": total_num_steps,
@@ -211,11 +259,15 @@ def train(args, seeds):
                 "train:mean_episode_return": np.mean(episode_rewards),
                 "train:median_episode_return": np.median(episode_rewards),
                 "test:mean_episode_return": np.mean(eval_episode_rewards),
+                "test:normalized_mean_episode_return": normalized_test_returns,
                 "test:median_episode_return": np.median(eval_episode_rewards),
                 "train_eval:mean_episode_return": np.mean(train_eval_episode_rewards),
+                "train_eval:normalized_mean_episode_return": normalized_train_returns,
                 "train_eval:median_episode_return": np.median(train_eval_episode_rewards),
                 "sps": sps,
+                "global_step": global_step
             }
+            wandb.log(stats, step=global_step)
             if is_minigrid:
                 stats["train:success_rate"] = np.mean(np.array(episode_rewards) > 0)
                 stats["train_eval:success_rate"] = np.mean(np.array(train_eval_episode_rewards) > 0)
@@ -227,7 +279,7 @@ def train(args, seeds):
 
                 mean_final_eval_episode_rewards = np.mean(final_eval_episode_rewards)
                 median_final_eval_episide_rewards = np.median(final_eval_episode_rewards)
-                
+
                 plogger.log_final_test_eval({
                     'num_test_seeds': args.final_num_test_seeds,
                     'mean_episode_return': mean_final_eval_episode_rewards,
